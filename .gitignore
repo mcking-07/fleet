@@ -1,0 +1,26 @@
+# env variables
+.env
+.env.*
+!.env.example
+
+# node build files
+build/
+dist/
+output/
+
+# node modules
+node_modules/
+
+# os artifacts
+.DS_Store
+
+# python caches
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+
+# python environments
+.pyenv/
+
+# rendered files
+rendered/
