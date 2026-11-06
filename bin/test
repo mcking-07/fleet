@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""Test bin/render in throwaway sandboxes. Never touches the real fleet or agent folders.
+
+Usage:
+  bin/test                 run every test
+  bin/test -k Secrets      run tests whose name contains "Secrets" (case-sensitive)
+  bin/test -v              list each test as it runs
+
+Exit codes: 0 all passed, 1 a test failed.
+"""
+
+import os, shutil, subprocess, sys, tempfile, unittest
+from pathlib import Path
+
+RENDER = Path(__file__).resolve().parent / "render"
+AGENTS = ["claude", "codex", "opencode", "pi", "prime-agent"]
+COMMANDS = {"claude": "commands", "opencode": "commands", "pi": "prompts", "prime-agent": "prompts"}
+FOUR = '["claude", "codex", "opencode", "pi"]'
+SECRET = "hook-value-1234"
+
+
+class Sandbox(unittest.TestCase):
+  def setUp(self):
+    self.home = Path(tempfile.mkdtemp(prefix="fleet-test-")).resolve()
+    self.fleet = self.home / "fleet"
+    (self.fleet / "bin").mkdir(parents=True)
+    shutil.copy(RENDER, self.fleet / "bin" / "render")
+    for agent in AGENTS:
+      (self.home / agent / "skills").mkdir(parents=True)
+
+    for agent, folder in COMMANDS.items():
+      (self.home / agent / folder).mkdir(parents=True)
+
+    self.env("")
+
+  def tearDown(self):
+    self.fleet.chmod(0o755)
+    shutil.rmtree(self.home)
+
+  def write(self, relative, text, mode=None):
+    path = self.fleet / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    if mode:
+      path.chmod(mode)
+
+    return path
+
+  def skill(self, name, body, agents=FOUR, extra=""):
+    return self.write(f"skills/{name}/SKILL.md", f"---\nname: {name}\ndescription: d.\n{extra}metadata:\n  agents: {agents}\n---\n{body}")
+
+  def command(self, name, body, agents='["claude", "opencode", "pi", "prime-agent"]'):
+    return self.write(f"commands/{name}.md", f"---\ndescription: d.\nmetadata:\n  agents: {agents}\n---\n{body}")
+
+  def agent_lines(self, agents=AGENTS):
+    return "".join(f"FLEET_{agent.upper().replace('-', '_')}_DIR={self.home / agent}\n" for agent in agents)
+
+  def env(self, text, mode=0o600, agents=AGENTS):
+    return self.write(".env", text + self.agent_lines(agents), mode)
+
+  def render(self, *args):
+    command = [sys.executable, self.fleet / "bin" / "render", *args]
+    environment = {**os.environ, "FLEET_CONFIG_DIR": str(self.fleet), "HOME": str(self.home)}
+    return subprocess.run(command, capture_output=True, text=True, env=environment, check=False)
+
+  def apply(self, *args):
+    result = self.render("--apply", *args)
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    return result
+
+  def target(self, agent, name, kind="skills"):
+    return os.path.relpath(os.readlink(self.home / agent / kind / name), self.fleet / "rendered")
+
+  def seen(self, agent, relative):
+    return (self.home / agent / relative).read_text()
+
+
+class Sharing(Sandbox):
+  def test_identical_output_is_shared(self):
+    self.skill("same", "same\n")
+    self.apply()
+    for agent in ["claude", "codex", "opencode", "pi"]:
+      self.assertEqual(self.target(agent, "same"), "shared/skills/same")
+
+  def test_one_agent_differs(self):
+    self.skill("odd", "core\n<!-- fleet:only pi -->\npi line\n<!-- fleet:end -->\n")
+    self.apply()
+    self.assertEqual(self.target("pi", "odd"), "pi/skills/odd")
+    for agent in ["claude", "codex", "opencode"]:
+      self.assertEqual(self.target(agent, "odd"), "shared/skills/odd")
+
+    self.assertIn("pi line", self.seen("pi", "skills/odd/SKILL.md"))
+    self.assertNotIn("pi line", self.seen("claude", "skills/odd/SKILL.md"))
+
+  def test_tie_goes_to_first_agent_group(self):
+    self.skill("tie", "<!-- fleet:only opencode pi -->\nA\n<!-- fleet:else -->\nB\n<!-- fleet:end -->\n")
+    self.apply()
+    self.assertEqual(self.target("claude", "tie"), "shared/skills/tie")
+    self.assertEqual(self.target("pi", "tie"), "pi/skills/tie")
+    self.assertTrue(self.seen("claude", "skills/tie/SKILL.md").endswith("B\n"))
+
+  def test_all_different_shares_nothing(self):
+    agents = ["claude", "codex", "pi"]
+    body = "<!-- fleet:only claude -->\nC\n<!-- fleet:end -->\n<!-- fleet:only codex -->\nX\n<!-- fleet:end -->\n"
+    self.skill("apart", body, '["claude", "codex", "pi"]')
+    self.apply()
+    self.assertEqual([self.target(agent, "apart") for agent in agents], [f"{agent}/skills/apart" for agent in agents])
+    self.assertFalse((self.fleet / "rendered/shared/skills/apart").exists())
+
+  def test_single_agent_is_shared(self):
+    self.skill("solo", "solo\n", '["pi"]')
+    self.apply()
+    self.assertEqual(self.target("pi", "solo"), "shared/skills/solo")
+    self.assertFalse((self.home / "claude/skills/solo").exists())
+
+  def test_commands_use_each_agent_folder(self):
+    self.command("cmd", "<!-- fleet:only prime-agent -->\nprime way\n<!-- fleet:else -->\nshell way\n<!-- fleet:end -->\n")
+    self.apply()
+    self.assertEqual(self.target("claude", "cmd.md", "commands"), "shared/commands/cmd.md")
+    self.assertEqual(self.target("pi", "cmd.md", "prompts"), "shared/commands/cmd.md")
+    self.assertEqual(self.target("prime-agent", "cmd.md", "prompts"), "prime-agent/commands/cmd.md")
+    self.assertIn("prime way", self.seen("prime-agent", "prompts/cmd.md"))
+
+  def test_link_follows_a_file_that_moves(self):
+    self.skill("moves", "same\n")
+    self.apply()
+    self.skill("moves", "<!-- fleet:only pi -->\npi\n<!-- fleet:end -->\n")
+    self.apply()
+    self.assertEqual(self.target("pi", "moves"), "pi/skills/moves")
+    self.skill("moves", "same again\n")
+    self.apply()
+    self.assertEqual(self.target("pi", "moves"), "shared/skills/moves")
+    self.assertFalse((self.fleet / "rendered/pi/skills/moves").exists())
+
+
+class Directives(Sandbox):
+  def body(self, agent, name="s"):
+    return self.seen(agent, f"skills/{name}/SKILL.md").split("---\n", 2)[2]
+
+  def test_only_except_else(self):
+    only = "<!-- fleet:only pi -->\nP\n<!-- fleet:else -->\nNP\n<!-- fleet:end -->\n"
+    self.skill("s", only + "<!-- fleet:except claude -->\nNC\n<!-- fleet:end -->\n")
+    self.apply()
+    self.assertEqual(self.body("pi"), "P\nNC\n")
+    self.assertEqual(self.body("claude"), "NP\n")
+    self.assertEqual(self.body("codex"), "NP\nNC\n")
+
+  def test_notes_are_dropped(self):
+    self.skill("s", "a\n<!-- fleet:note one line -->\nb\n<!-- fleet:note -->\nmany\nlines\n<!-- fleet:end -->\nc\n")
+    self.apply()
+    self.assertEqual(self.body("claude"), "a\nb\nc\n")
+
+  def test_blank_seam_collapses(self):
+    self.skill("s", "a\n\n<!-- fleet:only pi -->\nP\n<!-- fleet:end -->\n\nb\n")
+    self.apply()
+    self.assertEqual(self.body("claude"), "a\n\nb\n")
+    self.assertEqual(self.body("pi"), "a\n\nP\n\nb\n")
+
+  def test_block_at_start_leaves_no_blank_line(self):
+    self.write("instructions/AGENTS.md", "core\n")
+    self.write("instructions/APPEND_SYSTEM.md", "<!-- fleet:only pi -->\n# Title\n<!-- fleet:end -->\n\nrule\n")
+    self.apply()
+    self.assertEqual(self.seen("claude", "CLAUDE.md"), "core\n\nrule\n")
+    self.assertEqual(self.seen("pi", "APPEND_SYSTEM.md"), "# Title\n\nrule\n")
+
+  def test_agents_list_is_stripped(self):
+    self.skill("bare", "x\n")
+    self.write("skills/kept/SKILL.md", '---\nname: kept\ndescription: d.\nmetadata:\n  version: "1"\n  agents: ["pi"]\n---\nx\n')
+    self.apply()
+    self.assertEqual(self.seen("claude", "skills/bare/SKILL.md"), "---\nname: bare\ndescription: d.\n---\nx\n")
+    self.assertEqual(self.seen("pi", "skills/kept/SKILL.md"), '---\nname: kept\ndescription: d.\nmetadata:\n  version: "1"\n---\nx\n')
+
+  def test_block_list_of_agents(self):
+    self.write("skills/s/SKILL.md", "---\nname: s\ndescription: d.\nmetadata:\n  agents:\n    - claude\n    - pi\n---\nx\n")
+    self.apply()
+    self.assertTrue((self.home / "pi/skills/s").exists())
+    self.assertFalse((self.home / "codex/skills/s").exists())
+
+
+class Errors(Sandbox):
+  def fails(self, message, body=None, path=None, text=None):
+    if path:
+      self.write(path, text)
+    else:
+      self.skill("s", body)
+    result = self.render("--apply")
+    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+    self.assertIn(message, result.stderr)
+    self.assertNotIn("Traceback", result.stderr)
+    self.assertFalse((self.fleet / "rendered").exists())
+    self.assertFalse((self.home / "claude/skills/s").exists())
+
+  def test_nested_block(self):
+    self.fails("nested fleet block", "<!-- fleet:only pi -->\n<!-- fleet:only claude -->\nx\n<!-- fleet:end -->\n<!-- fleet:end -->\n")
+
+  def test_unclosed_block(self):
+    self.fails("is never closed", "<!-- fleet:only pi -->\nx\n")
+
+  def test_else_outside_block(self):
+    self.fails("fleet:else outside", "<!-- fleet:else -->\n")
+
+  def test_second_else(self):
+    self.fails("second fleet:else", "<!-- fleet:only pi -->\na\n<!-- fleet:else -->\nb\n<!-- fleet:else -->\n<!-- fleet:end -->\n")
+
+  def test_end_without_block(self):
+    self.fails("fleet:end without an open block", "<!-- fleet:end -->\n")
+
+  def test_unknown_agent_in_block(self):
+    self.fails("unknown agent(s): bob", "<!-- fleet:only bob -->\nx\n<!-- fleet:end -->\n")
+
+  def test_malformed_marker(self):
+    self.fails("malformed fleet marker", "<!-- fleet:onl pi -->\n")
+
+  def test_unknown_agent_in_metadata(self):
+    text = '---\nname: s\nmetadata:\n  agents: ["bob"]\n---\nx\n'
+    self.fails("unknown agent(s) in metadata.agents: bob", path="skills/s/SKILL.md", text=text)
+
+  def test_missing_agents(self):
+    self.fails("missing metadata.agents", path="skills/s/SKILL.md", text="---\nname: s\ndescription: d.\n---\nx\n")
+
+  def test_block_in_frontmatter(self):
+    text = '---\nname: s\n<!-- fleet:only pi -->\ndescription: d.\n<!-- fleet:end -->\nmetadata:\n  agents: ["pi"]\n---\nx\n'
+    self.fails("not allowed in frontmatter", path="skills/s/SKILL.md", text=text)
+
+  def test_codex_in_a_command(self):
+    self.fails("codex has no commands", path="commands/c.md", text='---\ndescription: d.\nmetadata:\n  agents: ["codex"]\n---\nx\n')
+
+  def test_missing_env_value(self):
+    self.fails("NOPE is not set in fleet/.env", "{{fleet:env:NOPE}}\n")
+
+  def test_malformed_placeholder(self):
+    self.env("X=1\n")
+    self.fails("malformed fleet:env placeholder", "{{ fleet:env:X }}\n")
+
+  def test_placeholder_in_frontmatter(self):
+    self.env("X=1\n")
+    text = '---\nname: s\ndescription: "{{fleet:env:X}}"\nmetadata:\n  agents: ["pi"]\n---\nx\n'
+    self.fails("fleet:env is not allowed in frontmatter", path="skills/s/SKILL.md", text=text)
+
+  def test_malformed_env_line(self):
+    self.env("not a pair\n")
+    self.fails(".env:1: expected KEY=value", "x\n")
+
+
+class Secrets(Sandbox):
+  def setUp(self):
+    super().setUp()
+    self.env(f'export HOOK="{SECRET}"\nPATH_ROOT=$HOME/code\n')
+    self.skill("s", "hook: {{fleet:env:HOOK}}\nroot: {{fleet:env:PATH_ROOT}}\n")
+    self.write("skills/s/scripts/hook", '#!/usr/bin/env bash\necho "{{fleet:env:HOOK}}"\n', 0o755)
+    self.write("skills/s/scripts/plain.sh", "#!/usr/bin/env bash\necho plain\n", 0o755)
+
+  def test_values_are_filled(self):
+    self.apply()
+    text = self.seen("claude", "skills/s/SKILL.md")
+    self.assertIn(f"hook: {SECRET}\n", text)
+    self.assertIn("root: $HOME/code\n", text)
+
+  def test_script_with_placeholder_runs(self):
+    self.apply()
+    script = self.home / "codex/skills/s/scripts/hook"
+    self.assertFalse(script.is_symlink())
+    self.assertEqual(subprocess.run([script], capture_output=True, text=True, check=False).stdout, f"{SECRET}\n")
+
+  def test_plain_files_are_copied(self):
+    self.apply()
+    plain = self.fleet / "rendered/shared/skills/s/scripts/plain.sh"
+    self.assertFalse(plain.is_symlink())
+    self.assertEqual(plain.read_text(), "#!/usr/bin/env bash\necho plain\n")
+    self.assertEqual(plain.stat().st_mode & 0o777, 0o555)
+
+  def test_diff_masks_values(self):
+    result = self.render("--diff")
+    self.assertNotIn(SECRET, result.stdout + result.stderr)
+    self.assertIn("{{fleet:env:HOOK}}", result.stdout)
+
+  def test_rotation_shows_no_value(self):
+    self.apply()
+    self.env("HOOK=rotated-value-5678\nPATH_ROOT=$HOME/code\n")
+    result = self.render("--diff")
+    self.assertIn("(only fleet:env values changed)", result.stdout)
+    self.assertNotIn("rotated-value-5678", result.stdout)
+    self.assertNotIn(SECRET, result.stdout)
+
+  def test_diff_masks_values_without_state(self):
+    self.apply()
+    (self.fleet / "rendered/.fleet-state.json").unlink()
+    self.skill("s", "hook: {{fleet:env:HOOK}}\nchanged\n")
+    result = self.render("--diff")
+    self.assertIn("{{fleet:env:HOOK}}", result.stdout)
+    self.assertNotIn(SECRET, result.stdout + result.stderr)
+
+  def test_open_env_warns(self):
+    self.env(f"HOOK={SECRET}\nPATH_ROOT=x\n", 0o644)
+    self.assertIn("readable by others", self.render().stderr)
+
+
+class Links(Sandbox):
+  def test_second_run_has_nothing_to_do(self):
+    self.skill("s", "x\n")
+    self.apply()
+    result = self.render()
+    self.assertEqual(result.returncode, 0)
+    self.assertIn("nothing to do", result.stdout)
+
+  def test_dry_run_changes_nothing(self):
+    self.skill("s", "x\n")
+    result = self.render()
+    self.assertIn("dry run", result.stdout)
+    self.assertFalse((self.fleet / "rendered").exists())
+    self.assertFalse((self.home / "claude/skills/s").exists())
+
+  def test_removed_skill_unlinks(self):
+    self.skill("s", "x\n")
+    self.apply()
+    shutil.rmtree(self.fleet / "skills/s")
+    self.apply()
+    self.assertFalse((self.home / "claude/skills/s").is_symlink())
+    self.assertFalse((self.fleet / "rendered/shared/skills/s").exists())
+
+  def test_foreign_link_is_a_conflict(self):
+    self.skill("s", "x\n")
+    elsewhere = self.home / "elsewhere"
+    elsewhere.mkdir()
+    (self.home / "claude/skills/s").symlink_to(elsewhere)
+    self.assertEqual(self.render().returncode, 1)
+    result = self.render("--apply")
+    self.assertEqual(result.returncode, 1)
+    self.assertIn("--replace-links", result.stdout)
+    self.assertEqual(Path(os.readlink(self.home / "claude/skills/s")), elsewhere)
+    self.apply("--replace-links")
+    self.assertEqual(self.target("claude", "s"), "shared/skills/s")
+
+  def test_real_folder_is_a_conflict(self):
+    self.skill("s", "x\n")
+    (self.home / "claude/skills/s").mkdir()
+    result = self.render("--apply", "--replace-links")
+    self.assertEqual(result.returncode, 1)
+    self.assertIn("real file or folder", result.stdout)
+    self.assertTrue((self.home / "claude/skills/s").is_dir())
+
+  def test_rendered_files_are_read_only(self):
+    self.skill("s", "x\n")
+    self.apply()
+    self.assertFalse(os.access(self.fleet / "rendered/shared/skills/s/SKILL.md", os.W_OK))
+
+  def test_hand_edit_blocks_apply(self):
+    self.skill("s", "x\n")
+    self.apply()
+    rendered = self.fleet / "rendered/shared/skills/s/SKILL.md"
+    rendered.chmod(0o644)
+    rendered.write_text("edited\n")
+    self.skill("s", "y\n")
+    result = self.render("--apply")
+    self.assertEqual(result.returncode, 2)
+    self.assertIn("edited by hand", result.stderr)
+    self.assertEqual(rendered.read_text(), "edited\n")
+    self.apply("--force")
+    self.assertTrue(rendered.read_text().endswith("y\n"))
+
+
+class Agents(Sandbox):
+  def test_disabled_agent_gets_nothing(self):
+    self.env("", agents=["claude", "codex", "opencode"])
+    self.skill("s", "x\n")
+    self.apply()
+    self.assertEqual(self.target("claude", "s"), "shared/skills/s")
+    self.assertFalse((self.home / "pi/skills/s").exists())
+    self.assertFalse((self.fleet / "rendered/pi").exists())
+
+  def test_disabling_removes_links(self):
+    self.write("instructions/AGENTS.md", "core\n")
+    self.skill("s", "x\n")
+    self.apply()
+    self.env("", agents=["claude", "codex", "opencode"])
+    self.apply()
+    self.assertFalse((self.home / "pi/skills/s").is_symlink())
+    self.assertFalse((self.home / "pi/AGENTS.md").is_symlink())
+    self.assertTrue((self.home / "claude/skills/s").is_symlink())
+
+  def test_custom_folder_with_home(self):
+    (self.home / "elsewhere/claude/skills").mkdir(parents=True)
+    self.write(".env", self.agent_lines(["pi"]) + "FLEET_CLAUDE_DIR=$HOME/elsewhere/claude\n")
+    self.skill("s", "x\n", '["claude", "pi"]')
+    self.apply()
+    self.assertTrue((self.home / "elsewhere/claude/skills/s/SKILL.md").exists())
+    self.assertFalse((self.home / "claude/skills/s").exists())
+
+  def test_moving_a_folder_moves_links(self):
+    self.skill("s", "x\n", '["claude"]')
+    self.apply()
+    (self.home / "moved").mkdir()
+    self.write(".env", f"FLEET_CLAUDE_DIR={self.home / 'moved'}\n")
+    self.apply()
+    self.assertTrue((self.home / "moved/skills/s").is_symlink())
+    self.assertFalse((self.home / "claude/skills/s").is_symlink())
+
+  def test_missing_folder_fails(self):
+    self.write(".env", f"FLEET_CLAUDE_DIR={self.home / 'nowhere'}\n")
+    result = self.render()
+    self.assertEqual(result.returncode, 2)
+    self.assertIn("which does not exist", result.stderr)
+    self.assertFalse((self.home / "nowhere").exists())
+
+  def test_no_agents_fails(self):
+    self.write(".env", "")
+    result = self.render()
+    self.assertEqual(result.returncode, 2)
+    self.assertIn("no agents enabled", result.stderr)
+
+  def test_unknown_agent_key_fails(self):
+    self.env("FLEET_CURSOR_DIR=/tmp\n")
+    result = self.render()
+    self.assertEqual(result.returncode, 2)
+    self.assertIn("FLEET_CURSOR_DIR does not name a known agent", result.stderr)
+
+  def test_agent_folders_are_not_secrets(self):
+    self.skill("s", "{{fleet:env:FLEET_CLAUDE_DIR}}\n")
+    result = self.render()
+    self.assertEqual(result.returncode, 2)
+    self.assertIn("FLEET_CLAUDE_DIR is not set in fleet/.env", result.stderr)
+
+
+class Copies(Sandbox):
+  def test_source_edit_waits_for_apply(self):
+    self.skill("s", "x\n")
+    self.write("skills/s/references/r.md", "old\n")
+    self.apply()
+    self.write("skills/s/references/r.md", "new\n")
+    self.assertEqual((self.home / "claude/skills/s/references/r.md").read_text(), "old\n")
+    self.apply()
+    self.assertEqual((self.home / "claude/skills/s/references/r.md").read_text(), "new\n")
+
+  def test_nothing_links_back_to_source(self):
+    self.skill("s", "x\n")
+    self.write("skills/s/references/r.md", "plain\n")
+    self.write("skills/s/scripts/run.sh", "echo hi\n", 0o755)
+    self.apply()
+    for path in (self.fleet / "rendered").rglob("*"):
+      self.assertFalse(Path(os.path.realpath(path)).is_relative_to(self.fleet / "skills"), path)
+
+  def test_venv_links_to_source_and_survives_apply(self):
+    self.skill("s", "x\n")
+    self.write("skills/s/scripts/.python-version", "3.12\n")
+    self.apply()
+    venv = self.fleet / "rendered/shared/skills/s/scripts/.pyenv"
+    self.assertEqual(Path(os.readlink(venv)), self.fleet / "skills/s/scripts/.pyenv")
+    (self.fleet / "skills/s/scripts/.pyenv/bin").mkdir(parents=True)
+    self.write("skills/s/references/r.md", "change\n")
+    self.apply()
+    self.assertTrue((self.home / "claude/skills/s/scripts/.pyenv/bin").is_dir())
+
+  def test_runtime_folders_are_linked(self):
+    self.skill("s", "x\n")
+    self.write("skills/s/scripts/node_modules/pkg/index.js", "x\n")
+    self.apply()
+    self.assertTrue((self.fleet / "rendered/shared/skills/s/scripts/node_modules").is_symlink())
+
+  def test_link_inside_fleet_is_rendered(self):
+    self.skill("s", "x\n")
+    self.write("skills/s/references/real.md", "shared {{fleet:env:API}}\n")
+    (self.fleet / "skills/s/references/alias.md").symlink_to("real.md")
+    self.env("API=value\n")
+    self.apply()
+    alias = self.fleet / "rendered/shared/skills/s/references/alias.md"
+    self.assertFalse(alias.is_symlink())
+    self.assertEqual(alias.read_text(), "shared value\n")
+
+  def test_binary_file_fails(self):
+    self.skill("s", "x\n")
+    (self.fleet / "skills/s/logo.png").write_bytes(b"\x89PNG\x00\xff")
+    result = self.render()
+    self.assertEqual(result.returncode, 2)
+    self.assertIn("binary files are not supported", result.stderr)
+
+
+class Verbatim(Sandbox):
+  def test_examples_pass_through(self):
+    body = "Use `<!-- fleet:only <ids> -->` and `{{fleet:env:NAME}}`.\n```md\n<!-- fleet:only pi -->\nx\n<!-- fleet:end -->\n```\n"
+    self.skill("s", body, extra="", agents='["claude", "pi"]\n  verbatim: true')
+    self.write("skills/s/references/syntax.md", body)
+    self.apply()
+    for agent in ["claude", "pi"]:
+      self.assertTrue((self.home / agent / "skills/s/SKILL.md").read_text().endswith(body))
+    self.assertEqual((self.home / "claude/skills/s/references/syntax.md").read_text(), body)
+    self.assertFalse(Path(os.path.realpath(self.home / "claude/skills/s/references/syntax.md")).is_relative_to(self.fleet / "skills"))
+
+  def test_flag_is_stripped(self):
+    self.skill("s", "x\n", agents='["claude"]\n  verbatim: true')
+    self.apply()
+    text = (self.home / "claude/skills/s/SKILL.md").read_text()
+    self.assertNotIn("verbatim", text)
+    self.assertNotIn("metadata", text)
+
+  def test_agents_still_apply(self):
+    self.skill("s", "x\n", agents='["claude"]\n  verbatim: true')
+    self.apply()
+    self.assertTrue((self.home / "claude/skills/s").is_symlink())
+    self.assertFalse((self.home / "pi/skills/s").exists())
+
+  def test_command_passes_through(self):
+    body = "Use `<!-- fleet:only <ids> -->` and `{{fleet:env:NAME}}`.\n"
+    self.command("c", body, agents='["claude"]\n  verbatim: true')
+    self.apply()
+    text = (self.home / "claude/commands/c.md").read_text()
+    self.assertTrue(text.endswith(body))
+    self.assertNotIn("verbatim", text)
+
+  def test_bad_value_fails(self):
+    self.skill("s", "x\n", agents='["claude"]\n  verbatim: yes')
+    result = self.render()
+    self.assertEqual(result.returncode, 2)
+    self.assertIn("metadata.verbatim must be true or false", result.stderr)
+
+
+class Swap(Sandbox):
+  def test_failed_apply_keeps_old_tree(self):
+    self.skill("s", "v1\n")
+    self.apply()
+    self.skill("s", "v2\n")
+    self.fleet.chmod(0o555)
+    result = self.render("--apply")
+    self.fleet.chmod(0o755)
+    self.assertEqual(result.returncode, 2)
+    self.assertIn("rendered/ and the links are unchanged", result.stderr)
+    self.assertNotIn("Traceback", result.stderr)
+    self.assertTrue(self.seen("claude", "skills/s/SKILL.md").endswith("v1\n"))
+
+  def test_crash_leftovers_are_cleared(self):
+    self.skill("s", "v1\n")
+    self.apply()
+    (self.fleet / "rendered.new").write_text("blocker")
+    (self.fleet / "rendered.old").mkdir()
+    self.skill("s", "v2\n")
+    self.apply()
+    self.assertTrue(self.seen("pi", "skills/s/SKILL.md").endswith("v2\n"))
+    self.assertFalse((self.fleet / "rendered.new").exists())
+    self.assertFalse((self.fleet / "rendered.old").exists())
+
+
+class Instructions(Sandbox):
+  def test_core_and_append_files(self):
+    self.write("instructions/AGENTS.md", "core\n<!-- fleet:only claude -->\nclaude only\n<!-- fleet:end -->\n")
+    self.write("instructions/APPEND_SYSTEM.md", "append\n")
+    self.apply()
+    self.assertEqual(self.seen("claude", "CLAUDE.md"), "core\nclaude only\n\nappend\n")
+    self.assertEqual(self.seen("codex", "AGENTS.md"), "core\n\nappend\n")
+    self.assertEqual(self.seen("pi", "AGENTS.md"), "core\n")
+    self.assertEqual(self.seen("pi", "APPEND_SYSTEM.md"), "append\n")
+    self.assertEqual(os.readlink(self.home / "pi/APPEND_SYSTEM.md"), str(self.fleet / "rendered/pi/APPEND_SYSTEM.md"))
+
+
+class Private(Sandbox):
+  def test_private_skill_and_command_render(self):
+    self.write("private/skills/p/SKILL.md", f"---\nname: p\ndescription: d.\nmetadata:\n  agents: {FOUR}\n---\nprivate\n")
+    self.write("private/commands/c.md", '---\ndescription: d.\nmetadata:\n  agents: ["claude", "pi"]\n---\ncmd\n')
+    self.skill("s", "public\n")
+    self.apply()
+    self.assertEqual(self.target("claude", "p"), "shared/skills/p")
+    self.assertEqual(self.seen("pi", "skills/p/SKILL.md"), "---\nname: p\ndescription: d.\n---\nprivate\n")
+    self.assertEqual(self.seen("claude", "commands/c.md"), "---\ndescription: d.\n---\ncmd\n")
+    self.assertTrue((self.home / "claude/skills/s").exists())
+
+  def test_empty_private_folder_is_fine(self):
+    (self.fleet / "private").mkdir()
+    self.skill("s", "public\n")
+    self.apply()
+    self.assertEqual(self.target("claude", "s"), "shared/skills/s")
+
+  def test_same_name_in_both_fails(self):
+    self.skill("s", "public\n")
+    self.write("private/skills/s/SKILL.md", f"---\nname: s\ndescription: d.\nmetadata:\n  agents: {FOUR}\n---\nprivate\n")
+    result = self.render("--apply")
+    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+    self.assertIn("private/skills/s/SKILL.md: s is also in skills/s/SKILL.md", result.stderr)
+    self.assertFalse((self.fleet / "rendered").exists())
+
+
+if __name__ == "__main__":
+  unittest.main()
