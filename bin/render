@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""Render fleet sources and link them into each agent's config folder. See README.md for how fleet works.
+
+Usage:
+  bin/render                              dry run: print the plan, change nothing
+  bin/render --diff                       dry run plus content diffs, with secrets masked
+  bin/render --apply                      write rendered/ and update links
+  bin/render --apply --replace-links      also re-target links that point outside fleet
+  bin/render --apply --force              overwrite rendered files that were edited by hand
+
+Exit codes: 0 clean, 1 conflicts or broken links, 2 errors.
+
+Agents, in fleet/.env:
+  FLEET_<AGENT>_DIR  enables that agent and names its config folder
+
+Environment:
+  FLEET_CONFIG_DIR  fleet repo, default: parent of bin/.
+"""
+
+import argparse, difflib, hashlib, json, os, re, shutil, sys
+from pathlib import Path
+from typing import NamedTuple
+
+FLEET = Path(os.environ.get("FLEET_CONFIG_DIR") or Path(__file__).parent.parent).resolve()
+PRIVATE = FLEET / "private"
+RENDERED = FLEET / "rendered"
+STAGING = FLEET / "rendered.new"
+RETIRED = FLEET / "rendered.old"
+STATE_NAME = ".fleet-state.json"
+ENV_FILE = FLEET / ".env"
+
+AGENTS = {
+  "claude": {"commands": "commands", "instructions": ["CLAUDE.md"]},
+  "codex": {"commands": None, "instructions": ["AGENTS.md"]},
+  "opencode": {"commands": "commands", "instructions": ["AGENTS.md"]},
+  "pi": {"commands": "prompts", "instructions": ["AGENTS.md", "APPEND_SYSTEM.md"]},
+  "prime-agent": {"commands": "prompts", "instructions": ["AGENTS.md", "APPEND_SYSTEM.md"]},
+}
+SHARED = "shared"
+
+SKIP_DIRS = {".git", ".pyenv", "node_modules", "__pycache__", ".mypy_cache", ".ruff_cache"}
+MARKER = re.compile(r"<!--\s*fleet:")
+OPEN = re.compile(r"^\s*<!--\s*fleet:(only|except)\s+([a-z0-9 -]+?)\s*-->\s*$")
+ELSE = re.compile(r"^\s*<!--\s*fleet:else\s*-->\s*$")
+END = re.compile(r"^\s*<!--\s*fleet:end\s*-->\s*$")
+NOTE_OPEN = re.compile(r"^\s*<!--\s*fleet:note\s*-->\s*$")
+NOTE_LINE = re.compile(r"^\s*<!--\s*fleet:note\s+\S.*?-->\s*$")
+PLACEHOLDER = re.compile(r"\{\{fleet:env:([A-Za-z_][A-Za-z0-9_]*)\}\}")
+ENV_MARKER = re.compile(r"\{\{\s*fleet:")
+AGENT_DIR = re.compile(r"^FLEET_[A-Z0-9_]+_DIR$")
+
+secrets = {}
+agent_dirs = {}
+
+
+class FleetError(Exception):
+  pass
+
+
+class Output(NamedTuple):
+  text: str
+  masked: str
+  executable: bool
+
+
+def relative(path):
+  return os.path.relpath(path, FLEET)
+
+
+def split_frontmatter(text):
+  if not text.startswith("---\n"):
+    return "", text
+
+  end = text.find("\n---\n", 4)
+  if end == -1:
+    return "", text
+
+  return text[: end + 5], text[end + 5 :]
+
+
+def parse_agents(text, source):
+  lines = split_frontmatter(text)[0].splitlines()
+  for index, line in enumerate(lines):
+    if line.rstrip() != "metadata:":
+      continue
+
+    for offset, inner in enumerate(lines[index + 1 :], start=index + 1):
+      if inner and not inner.startswith(" "):
+        break
+
+      match = re.match(r"^(\s+)agents:\s*(.*)$", inner)
+      if not match:
+        continue
+
+      indent, value = len(match.group(1)), match.group(2).strip()
+      if value.startswith("["):
+        items = [item.strip().strip("\"'") for item in value.strip("[]").split(",")]
+      else:
+        items = []
+        for item in lines[offset + 1 :]:
+          bullet = re.match(r"^(\s+)-\s*(.+)$", item)
+          if not bullet or len(bullet.group(1)) <= indent:
+            break
+          items.append(bullet.group(2).strip().strip("\"'"))
+
+      agents = [item for item in items if item]
+      unknown = [agent for agent in agents if agent not in AGENTS]
+      if unknown:
+        raise FleetError(f"{relative(source)}: unknown agent(s) in metadata.agents: {', '.join(unknown)}")
+
+      return agents
+
+  raise FleetError(f"{relative(source)}: missing metadata.agents")
+
+
+def parse_verbatim(text, source):
+  frontmatter = split_frontmatter(text)[0]
+  block = re.search(r"^metadata:\n((?:[ ].*\n)*)", frontmatter, re.MULTILINE)
+  match = re.search(r"^\s+verbatim:\s*(.*)$", block.group(1), re.MULTILINE) if block else None
+  if not match:
+    return False
+
+  value = match.group(1).strip()
+  if value not in ("true", "false"):
+    raise FleetError(f"{relative(source)}: metadata.verbatim must be true or false")
+  return value == "true"
+
+
+def strip_agents(text):
+  frontmatter, body = split_frontmatter(text)
+  lines, kept_lines, index = frontmatter.splitlines(keepends=True), [], 0
+  while index < len(lines):
+    line = lines[index]
+    if line.rstrip("\n") != "metadata:":
+      kept_lines.append(line)
+      index += 1
+      continue
+
+    end = index + 1
+    while end < len(lines) and lines[end].startswith(" "):
+      end += 1
+
+    children, kept_children, cursor = lines[index + 1 : end], [], 0
+    while cursor < len(children):
+      match = re.match(r"^(\s+)(?:agents|verbatim):", children[cursor])
+      if not match:
+        kept_children.append(children[cursor])
+        cursor += 1
+        continue
+
+      depth, cursor = len(match.group(1)), cursor + 1
+      while cursor < len(children) and len(children[cursor]) - len(children[cursor].lstrip(" ")) > depth:
+        cursor += 1
+
+    if kept_children:
+      kept_lines += [line, *kept_children]
+    index = end
+
+  return "".join(kept_lines) + body
+
+
+def apply_directives(text, agent, source):
+  frontmatter, body = split_frontmatter(text)
+  if MARKER.search(frontmatter):
+    raise FleetError(f"{relative(source)}: fleet blocks are not allowed in frontmatter")
+
+  kept, block, keep, seen_else, opened_at, seam = [], None, True, False, 0, False
+  for number, line in enumerate(body.splitlines(keepends=True), start=frontmatter.count("\n") + 1):
+    where = f"{relative(source)}:{number}"
+    opening, note = OPEN.match(line), NOTE_OPEN.match(line)
+    if opening or note:
+      if block is not None:
+        raise FleetError(f"{where}: nested fleet block (fleet:{block} open since line {opened_at})")
+
+      block, seen_else, opened_at = ("note" if note else opening.group(1)), False, number
+      if note:
+        keep = False
+      else:
+        targets = opening.group(2).split()
+        unknown = [target for target in targets if target not in AGENTS]
+        if unknown:
+          raise FleetError(f"{where}: unknown agent(s): {', '.join(unknown)}")
+        keep = (agent in targets) == (block == "only")
+
+    elif ELSE.match(line):
+      if block not in ("only", "except"):
+        raise FleetError(f"{where}: fleet:else outside fleet:only or fleet:except")
+      if seen_else:
+        raise FleetError(f"{where}: second fleet:else in the block opened at line {opened_at}")
+      seen_else, keep = True, not keep
+
+    elif END.match(line):
+      if block is None:
+        raise FleetError(f"{where}: fleet:end without an open block")
+      block, keep = None, True
+
+    elif MARKER.search(line) and not NOTE_LINE.match(line):
+      raise FleetError(f"{where}: malformed fleet marker")
+
+    elif keep and not NOTE_LINE.match(line):
+      blank = not line.strip()
+      if not (seam and blank and (not kept or not kept[-1].strip())):
+        kept.append(line)
+      seam = seam and blank
+      continue
+
+    seam = True
+
+  if block is not None:
+    raise FleetError(f"{relative(source)}:{opened_at}: fleet:{block} is never closed")
+
+  return frontmatter + "".join(kept)
+
+
+def load_env():
+  values = {}
+  if not ENV_FILE.exists():
+    return values
+
+  for number, line in enumerate(ENV_FILE.read_text().splitlines(), start=1):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+      continue
+
+    match = re.match(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", stripped)
+    if not match:
+      raise FleetError(f".env:{number}: expected KEY=value")
+
+    value = match.group(2).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+      value = value[1:-1]
+    values[match.group(1)] = value
+
+  return values
+
+
+def load_agents(values):
+  keys = {f"FLEET_{agent.upper().replace('-', '_')}_DIR": agent for agent in AGENTS}
+  for key in [key for key in values if AGENT_DIR.match(key)]:
+    value = values.pop(key)
+    if key not in keys:
+      raise FleetError(f".env: {key} does not name a known agent")
+    if not value:
+      continue
+
+    folder = Path(re.sub(r"^~(?=/|$)", "$HOME", value).replace("${HOME}", "$HOME").replace("$HOME", str(Path.home())))
+    if not folder.is_absolute():
+      raise FleetError(f".env: {key} must be an absolute path")
+    if not folder.is_dir():
+      raise FleetError(f".env: {key} points to {folder}, which does not exist")
+    agent_dirs[keys[key]] = folder
+
+  if not agent_dirs:
+    raise FleetError("no agents enabled; set FLEET_<AGENT>_DIR in fleet/.env")
+
+
+def fill_env(text, source, fill=True):
+  frontmatter = split_frontmatter(text)[0] if source.suffix == ".md" else ""
+  if ENV_MARKER.search(frontmatter):
+    raise FleetError(f"{relative(source)}: fleet:env is not allowed in frontmatter")
+
+  for number, line in enumerate(text.splitlines(), start=1):
+    if len(ENV_MARKER.findall(line)) != len(PLACEHOLDER.findall(line)):
+      raise FleetError(f"{relative(source)}:{number}: malformed fleet:env placeholder")
+    for name in PLACEHOLDER.findall(line):
+      if name not in secrets:
+        raise FleetError(f"{relative(source)}:{number}: {name} is not set in fleet/.env")
+
+  return PLACEHOLDER.sub(lambda match: secrets[match.group(1)], text) if fill else text
+
+
+def mask(text):
+  for name, value in sorted(secrets.items(), key=lambda item: -len(item[1])):
+    if len(value) >= 4:
+      text = text.replace(value, f"{{{{fleet:env:{name}}}}}")
+  return text
+
+
+def read_text(path):
+  try:
+    return path.read_text()
+  except UnicodeDecodeError:
+    return None
+
+
+def render_text(source, agent, fill=True):
+  text = source.read_text()
+  if source.suffix == ".md":
+    text = apply_directives(text, agent, source)
+  return fill_env(text, source, fill)
+
+
+def render(source, agent, verbatim=False):
+  source = source.resolve()
+  if read_text(source) is None:
+    raise FleetError(f"{relative(source)}: binary files are not supported")
+  if verbatim:
+    text = masked = source.read_text()
+  else:
+    text, masked = render_text(source, agent), render_text(source, agent, fill=False)
+  if source.suffix == ".md":
+    text, masked = strip_agents(text), strip_agents(masked)
+  return Output(text, masked, os.access(source, os.X_OK))
+
+
+def skill_tree(skill_dir, agent, verbatim=False):
+  outputs, inner_links = {}, {}
+
+  def walk(folder, prefix):
+    for entry in sorted(folder.iterdir()):
+      name = prefix / entry.name
+      if entry.name in SKIP_DIRS or (entry.is_symlink() and not entry.resolve().is_relative_to(FLEET)):
+        inner_links[name] = entry
+      elif entry.is_dir():
+        walk(entry, name)
+      else:
+        outputs[name] = render(entry, agent, verbatim)
+
+    if (folder / ".python-version").is_file():
+      inner_links[prefix / ".pyenv"] = folder / ".pyenv"
+
+  walk(skill_dir, Path())
+  return outputs, inner_links
+
+
+def shared_agents(trees):
+  groups = []
+  for agent in sorted(trees):
+    group = next((group for group in groups if trees[group[0]] == trees[agent]), None)
+    if group:
+      group.append(agent)
+    else:
+      groups.append([agent])
+
+  largest = max(groups, key=len)
+  return set(largest) if len(groups) == 1 or len(largest) > 1 else set()
+
+
+def instruction_outputs(spec):
+  main, outputs = spec["instructions"][0], {name: [] for name in spec["instructions"]}
+  folder = FLEET / "instructions"
+  sources = sorted(folder.glob("*.md"), key=lambda path: (path.name != "AGENTS.md", path.name)) if folder.is_dir() else []
+  for source in sources:
+    own_file = source.name != "AGENTS.md" and source.name in outputs
+    outputs[source.name if own_file else main].append(source)
+  return outputs
+
+
+def source_files(kind, pattern):
+  found = {}
+  for root in (FLEET, PRIVATE):
+    for path in (root / kind).glob(pattern):
+      name = path.parent.name if path.name == "SKILL.md" else path.name
+      if name in found:
+        raise FleetError(f"{relative(path)}: {name} is also in {relative(found[name])}")
+      found[name] = path
+
+  return [found[name] for name in sorted(found)]
+
+
+def plan():
+  outputs, inner_links, links = {}, {}, {}
+
+  def place(trees, kind, name):
+    shared, roots = shared_agents(trees), {}
+    for agent, (tree_outputs, tree_links) in trees.items():
+      root = RENDERED / (SHARED if agent in shared else agent) / kind / name
+      outputs.update({root / path: output for path, output in tree_outputs.items()})
+      inner_links.update({root / path: target for path, target in tree_links.items()})
+      roots[agent] = root
+    return roots
+
+  for skill in source_files("skills", "*/SKILL.md"):
+    agents = [agent for agent in parse_agents(skill.read_text(), skill) if agent in agent_dirs]
+    if not agents:
+      continue
+
+    verbatim = parse_verbatim(skill.read_text(), skill)
+    roots = place({agent: skill_tree(skill.parent, agent, verbatim) for agent in agents}, "skills", skill.parent.name)
+    for agent, root in roots.items():
+      links[agent_dirs[agent] / "skills" / skill.parent.name] = root
+
+  for command in source_files("commands", "*.md"):
+    agents = parse_agents(command.read_text(), command)
+    for agent in agents:
+      if AGENTS[agent]["commands"] is None:
+        raise FleetError(f"{relative(command)}: {agent} has no commands; remove it from metadata.agents")
+
+    agents = [agent for agent in agents if agent in agent_dirs]
+    if not agents:
+      continue
+
+    verbatim = parse_verbatim(command.read_text(), command)
+    trees = {agent: ({Path(command.name): render(command, agent, verbatim)}, {}) for agent in agents}
+    for agent, root in place(trees, "commands", "").items():
+      links[agent_dirs[agent] / AGENTS[agent]["commands"] / command.name] = root / command.name
+
+  for agent, spec in AGENTS.items():
+    if agent not in agent_dirs:
+      continue
+
+    for name, sources in instruction_outputs(spec).items():
+      if not sources:
+        continue
+
+      text = "\n".join(render_text(source, agent).rstrip("\n") + "\n" for source in sources)
+      masked = "\n".join(render_text(source, agent, fill=False).rstrip("\n") + "\n" for source in sources)
+      outputs[RENDERED / agent / name] = Output(text, masked, False)
+      links[agent_dirs[agent] / name] = RENDERED / agent / name
+
+  return outputs, inner_links, links
+
+
+def owned(path):
+  return path.is_symlink() and Path(os.readlink(path)).is_relative_to(FLEET)
+
+
+def managed_paths():
+  yield from (Path(link) for link in load_state()["links"])
+  for agent, base in agent_dirs.items():
+    spec = AGENTS[agent]
+    folders = [base / "skills"] + ([base / spec["commands"]] if spec["commands"] else [])
+    for folder in folders:
+      if folder.is_dir():
+        yield from folder.iterdir()
+
+    for name in spec["instructions"]:
+      if (base / name).is_symlink() or (base / name).exists():
+        yield base / name
+
+
+def checksum(text):
+  return hashlib.sha256(text.encode()).hexdigest()
+
+
+def current_rendered():
+  texts, links = {}, {}
+  if not RENDERED.exists():
+    return texts, links
+
+  for current, dirs, names in os.walk(RENDERED):
+    for name in dirs + names:
+      path = Path(current) / name
+      if path == RENDERED / STATE_NAME:
+        continue
+      if path.is_symlink():
+        links[path] = Path(os.readlink(path))
+      elif path.is_file():
+        texts[path] = path.read_text()
+
+  return texts, links
+
+
+def load_state():
+  state_file = RENDERED / STATE_NAME
+  state = json.loads(state_file.read_text()) if state_file.exists() else {}
+  return state if "files" in state else {"files": state, "links": []}
+
+
+def hand_edits():
+  edited = []
+  for name, entry in load_state()["files"].items():
+    path = RENDERED / name
+    if path.is_file() and not path.is_symlink() and checksum(path.read_text()) != entry["sha256"]:
+      edited.append(path)
+  return edited
+
+
+def compare(outputs, inner_links, links, replace_links):
+  have_texts, have_links = current_rendered()
+  rendered = []
+  for path in sorted(set(outputs) | set(have_texts)):
+    if path not in have_texts:
+      rendered.append(("+", path))
+    elif path not in outputs:
+      rendered.append(("-", path))
+    elif outputs[path].text != have_texts[path]:
+      rendered.append(("~", path))
+
+  for path in sorted(set(inner_links) | set(have_links)):
+    if have_links.get(path) != inner_links.get(path):
+      rendered.append(("+" if path not in have_links else "-" if path not in inner_links else "~", path))
+
+  actions, conflicts = [], []
+  for link, target in sorted(links.items()):
+    if link.is_symlink():
+      current = Path(os.readlink(link))
+      if current == target:
+        continue
+      if owned(link) or replace_links:
+        actions.append(("~", link, target, current))
+      else:
+        conflicts.append((link, f"link to {current}; rerun with --replace-links to switch it"))
+    elif link.exists():
+      conflicts.append((link, "real file or folder; move it into fleet by hand"))
+    else:
+      actions.append(("+", link, target, None))
+
+  for path in sorted(set(managed_paths())):
+    if owned(path) and path not in links:
+      actions.append(("-", path, None, Path(os.readlink(path))))
+
+  return rendered, actions, conflicts
+
+
+def show(rendered, actions, conflicts, outputs, diff):
+  print(f"fleet: {FLEET}")
+  if not rendered and not actions and not conflicts:
+    print("nothing to do")
+    return
+
+  have_texts, state = current_rendered()[0], load_state()
+  for sign, path in rendered:
+    print(f"  {sign} rendered/{path.relative_to(RENDERED)}")
+    if not diff or path not in outputs or sign not in "+~":
+      continue
+
+    old = state["files"].get(str(path.relative_to(RENDERED)), {}).get("masked", mask(have_texts.get(path, "")))
+    new = outputs[path].masked
+    if old == new:
+      print("    (only fleet:env values changed)")
+      continue
+
+    old_lines, new_lines = old.splitlines(keepends=True), new.splitlines(keepends=True)
+    sys.stdout.writelines(difflib.unified_diff(old_lines, new_lines, f"a/{relative(path)}", f"b/{relative(path)}"))
+
+  for sign, link, target, current in actions:
+    tail = {"+": f"-> {target}", "~": f"{current} -> {target}", "-": f"(was {current})"}[sign]
+    print(f"  {sign} {link} {tail}")
+
+  for link, reason in conflicts:
+    print(f"  ! {link}: {reason}")
+
+
+def clear(path):
+  if path.is_symlink() or path.is_file():
+    path.unlink()
+  elif path.exists():
+    shutil.rmtree(path)
+
+
+def staged(path):
+  return STAGING / path.relative_to(RENDERED)
+
+
+def write_tree(outputs, inner_links, links):
+  clear(STAGING)
+  STAGING.mkdir(parents=True)
+  state = {"files": {}, "links": sorted(str(link) for link in links)}
+  for path, output in sorted(outputs.items()):
+    target = staged(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(output.text)
+    target.chmod(0o555 if output.executable else 0o444)
+    state["files"][str(path.relative_to(RENDERED))] = {"sha256": checksum(output.text), "masked": output.masked}
+
+  for path, target in sorted(inner_links.items()):
+    staged(path).parent.mkdir(parents=True, exist_ok=True)
+    staged(path).symlink_to(target)
+
+  (STAGING / STATE_NAME).write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def swap_tree():
+  clear(RETIRED)
+  had_tree = RENDERED.exists()
+  if had_tree:
+    RENDERED.rename(RETIRED)
+
+  try:
+    STAGING.rename(RENDERED)
+  except OSError:
+    if had_tree:
+      RETIRED.rename(RENDERED)
+    raise
+
+  try:
+    clear(RETIRED)
+  except OSError:
+    pass
+
+
+def update_links(links, actions):
+  for sign, link, target, _ in actions:
+    if sign in "~-":
+      link.unlink()
+    if sign in "+~":
+      link.parent.mkdir(parents=True, exist_ok=True)
+      link.symlink_to(target)
+
+  broken = [link for link in links if link.is_symlink() and not link.exists()]
+  for link in broken:
+    print(f"  broken: {link}")
+  return not broken
+
+
+def main():
+  parser = argparse.ArgumentParser(description="Render fleet sources and link them into agent config folders.")
+  parser.add_argument("--apply", action="store_true", help="write rendered/ and update links")
+  parser.add_argument("--diff", action="store_true", help="show content diffs for rendered files")
+  parser.add_argument("--replace-links", action="store_true", help="retarget links that point outside fleet")
+  parser.add_argument("--force", action="store_true", help="overwrite rendered files that were edited by hand")
+  args = parser.parse_args()
+
+  if SHARED in AGENTS:
+    print(f"error: {SHARED} is reserved for rendered/{SHARED}/ and cannot be an agent ID", file=sys.stderr)
+    return 2
+
+  try:
+    values = load_env()
+    load_agents(values)
+    secrets.update(values)
+    outputs, inner_links, links = plan()
+  except FleetError as error:
+    print(f"error: {error}", file=sys.stderr)
+    return 2
+
+  if ENV_FILE.exists() and ENV_FILE.stat().st_mode & 0o077:
+    print(f"warning: {ENV_FILE} is readable by others; run chmod 600 {ENV_FILE}", file=sys.stderr)
+
+  rendered, actions, conflicts = compare(outputs, inner_links, links, args.replace_links)
+  show(rendered, actions, conflicts, outputs, args.diff)
+
+  edited = hand_edits()
+  for path in edited:
+    print(f"  edited by hand: {path}", file=sys.stderr)
+
+  if not args.apply:
+    if rendered or actions:
+      print("dry run. rerun with --apply to make these changes.")
+    return 1 if conflicts else 0
+
+  if edited and not args.force:
+    print("error: rendered files were edited by hand; move the change into the source, or rerun with --force", file=sys.stderr)
+    return 2
+
+  try:
+    write_tree(outputs, inner_links, links)
+    swap_tree()
+  except OSError as error:
+    clear(STAGING)
+    print(f"error: {error}; rendered/ and the links are unchanged", file=sys.stderr)
+    return 2
+
+  try:
+    ok = update_links(links, actions)
+  except OSError as error:
+    print(f"error: {error}; rendered/ is updated, but some links were not; rerun --apply", file=sys.stderr)
+    return 2
+
+  print("applied." + (f" {len(conflicts)} conflict(s) skipped." if conflicts else ""))
+  return 0 if ok and not conflicts else 1
+
+
+if __name__ == "__main__":
+  sys.exit(main())
