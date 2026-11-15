@@ -1,0 +1,14 @@
+include = ["*.py", "*.pyi", "*.ipynb", "**/pyproject.toml"]
+extend-include = ["bin/*"]
+extend-exclude = [".pyenv", ".venv"]
+indent-width = 2
+line-length = 200
+
+[format]
+docstring-code-format = true
+docstring-code-line-length = 80
+quote-style = "double"
+skip-magic-trailing-comma = true
+
+[lint]
+ignore = ["E401", "I001"]
