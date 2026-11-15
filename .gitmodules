@@ -1,0 +1,5 @@
+[submodule "private"]
+	path = private
+	url = https://github.com/mcking-07/fleet-private.git
+	branch = main
+	update = merge
