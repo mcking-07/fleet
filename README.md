@@ -10,6 +10,9 @@ fleet keeps one source for all of them. `bin/render` renders each file per agent
 
 It supports Claude Code (`claude`), Codex (`codex`), OpenCode (`opencode`), Pi (`pi`), and Prime Agent (`prime-agent`).
 
+> [!NOTE]
+> Text that differs per agent sits between fleet markers, which are HTML comments. GitHub's Preview hides the markers. To see which text goes to which agent, switch the file to Code view.
+
 ## Setup
 
 1. Clone this repo to `~/.config/fleet`.
